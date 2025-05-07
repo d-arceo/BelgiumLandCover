@@ -1,324 +1,248 @@
+# Set the working directory
 setwd("C:/Users/Daniel/Documents/Land Cover Map")
-# 1. PACKAGES
 
+# ---------------------------
+# 1. Load Packages
+# ---------------------------
+
+# List of packages we'll need
 libs <- c(
-  "terra",
-  "giscoR",
-  "sf",
-  "tidyverse",
-  "ggtern",
-  "elevatr",
-  "png",
-  "rayshader",
-  "magick"
+  "terra",      # for raster data
+  "giscoR",     # to get country borders
+  "sf",         # spatial data stuff
+  "tidyverse",  # data wrangling
+  "ggtern",     # for converting RGB to hex
+  "elevatr",    # to download elevation data
+  "png",        # to read PNGs
+  "rayshader",  # for the 3D magic
+  "magick"      # for combining/overlaying images
 )
 
-installed_libraries <- libs %in% rownames(
-  installed.packages()
-)
-
-if(any(installed_libraries == F)){
-  install.packages(
-    libs[!installed_libraries]
-  )
+# Install any missing packages
+installed_libraries <- libs %in% rownames(installed.packages())
+if(any(installed_libraries == FALSE)){
+  install.packages(libs[!installed_libraries])
 }
 
-invisible(
-  lapply(
-    libs, library, character.only = T
-  )
-)
+# Load everything
+invisible(lapply(libs, library, character.only = TRUE))
 
-# 2. COUNTRY BORDERS
+# ---------------------------
+# 2. Get Country Borders
+# ---------------------------
 
-country_sf <- giscoR::gisco_get_countries(
-  country = "BE",
-  resolution = "1"
-)
+# Pull in Belgium's borders from GISCO
+country_sf <- giscoR::gisco_get_countries(country = "BE", resolution = "1")
 
+# Quick plot to check
 plot(sf::st_geometry(country_sf))
 
+# Save it as a PNG too
 png("bih-borders.png")
 plot(sf::st_geometry(country_sf))
 dev.off()
 
-# 3 DOWNLOAD ESRI LAND COVER TILES
+# ---------------------------
+# 3. Download ESRI Land Cover Tiles
+# ---------------------------
 
+# Grab land cover data for Belgium (2 tiles)
 urls <- c(
   "https://lulctimeseries.blob.core.windows.net/lulctimeseriesv003/lc2024/31U_20240101-20241231.tif",
   "https://lulctimeseries.blob.core.windows.net/lulctimeseriesv003/lc2024/32U_20240101-20241231.tif"
 )
 
+# Download each tile
 for(url in urls){
-  download.file(
-    url = url,
-    destfile = basename(url),
-    mode = "wb"
-  )
+  download.file(url = url, destfile = basename(url), mode = "wb")
 }
 
-# 4 LOAD TILES
+# ---------------------------
+# 4. Crop & Reproject to Belgium
+# ---------------------------
 
-raster_files <- list.files(
-  path = getwd(),
-  pattern = "20241231.tif$",
-  full.names = T
-)
+# Get the files we just downloaded
+raster_files <- list.files(path = getwd(), pattern = "20241231.tif$", full.names = TRUE)
+crs <- "EPSG:4326"  # WGS84
 
-crs <- "EPSG:4326"
-
+# Loop through each raster
 for(raster in raster_files){
   rasters <- terra::rast(raster)
-  
-  country <- country_sf |>
-    sf::st_transform(
-      crs = terra::crs(
-        rasters
-      )
-    )
-  
-  land_cover <- terra::crop(
-    rasters,
-    terra::vect(
-      country
-    ),
-    snap = "in",
-    mask = T
-  ) |>
-    terra::aggregate(
-      fact = 5,
-      fun = "modal"
-    ) |>
+
+  # Reproject the country shape to match the raster
+  country <- country_sf |> sf::st_transform(crs = terra::crs(rasters))
+
+  # Crop and mask to Belgium, downscale a bit, and reproject to WGS84
+  land_cover <- terra::crop(rasters, terra::vect(country), snap = "in", mask = TRUE) |>
+    terra::aggregate(fact = 5, fun = "modal") |>  # reduce resolution for speed
     terra::project(crs)
-  
-  terra::writeRaster(
-    land_cover,
-    paste0(
-      raster,
-      "_belgium",
-      ".tif"
-    )
-  )
+
+  # Save it
+  terra::writeRaster(land_cover, paste0(raster, "_belgium", ".tif"))
 }
 
-# 5 LOAD VIRTUAL LAYER
+# ---------------------------
+# 5. Combine into One Raster (VRT)
+# ---------------------------
 
-r_list <- list.files(
-  path = getwd(),
-  pattern = "_belgium",
-  full.names = T
-)
+# Grab all the processed belgium files
+r_list <- list.files(path = getwd(), pattern = "_belgium", full.names = TRUE)
 
-land_cover_vrt <- terra::vrt(
-  r_list,
-  "belgium_land_cover_vrt.vrt",
-  overwrite = T
-)
+# Make a virtual raster to treat them as one
+land_cover_vrt <- terra::vrt(r_list, "belgium_land_cover_vrt.vrt", overwrite = TRUE)
 
-# 6 FETCH ORIGINAL COLORS
+# ---------------------------
+# 6. Get the Color Table
+# ---------------------------
 
-ras <- terra::rast(
-  raster_files[[1]]
-)
+# Grab one raster to extract the color codes
+ras <- terra::rast(raster_files[[1]])
 
-raster_color_table <- do.call(
-  data.frame,
-  terra::coltab(ras)
-)
+# Extract the RGB table
+raster_color_table <- do.call(data.frame, terra::coltab(ras))
 
-head(raster_color_table)
-
+# Convert to hex
 hex_code <- ggtern::rgb2hex(
   r = raster_color_table[,2],
   g = raster_color_table[,3],
   b = raster_color_table[,4]
 )
 
-# 7 ASSIGN COLORS TO RASTER
+# ---------------------------
+# 7. Color the Raster
+# ---------------------------
 
+# Pick a subset of colors for display
 cols <- hex_code[c(2:3, 5:6, 8:12)]
-
 from <- c(1:2, 4:5, 7:11)
 to <- t(col2rgb(cols))
+
+# Remove any NA values just in case
 land_cover_vrt <- na.omit(land_cover_vrt)
 
-land_cover_belgium <- terra::subst(
-  land_cover_vrt,
-  from = from,
-  to = to,
-  names = cols
-)
+# Assign RGB colors to the raster values
+land_cover_belgium <- terra::subst(land_cover_vrt, from = from, to = to, names = cols)
 
+# Quick look
 terra::plotRGB(land_cover_belgium)
 
-# 8 DIGITAL ELEVATION MODEL
+# ---------------------------
+# 8. Get Elevation Data
+# ---------------------------
 
-elev <- elevatr::get_elev_raster(
-  locations = country_sf,
-  z = 9, clip = "locations"
-)
+# Download DEM for Belgium
+elev <- elevatr::get_elev_raster(locations = country_sf, z = 9, clip = "locations")
 
-crs_lambert <-
-  "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +datum=WGS84 +units=m +no_frfs"
+# Define a Lambert projection (nice for Europe maps)
+crs_lambert <- "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +datum=WGS84 +units=m +no_frfs"
 
-land_cover_belgium_resampled <- terra::resample(
-  x = land_cover_belgium,
-  y = terra::rast(elev),
-  method = "near"
-) |>
+# Match the elevation raster's resolution and reproject
+land_cover_belgium_resampled <- terra::resample(land_cover_belgium, terra::rast(elev), method = "near") |>
   terra::project(crs_lambert)
 
+# Preview it
 terra::plotRGB(land_cover_belgium_resampled)
 
+# Save as PNG
 img_file <- "land_cover_belgium.png"
-
-terra::writeRaster(
-  land_cover_belgium_resampled,
-  img_file,
-  overwrite = T,
-  NAflag = 255
-)
-
+terra::writeRaster(land_cover_belgium_resampled, img_file, overwrite = TRUE, NAflag = 255)
 img <- png::readPNG(img_file)
 
-# 9. RENDER SCENE
-#----------------
+# ---------------------------
+# 9. 3D Render with Rayshader
+# ---------------------------
 
-elev_lambert <- elev |>
-  terra::rast() |>
-  terra::project(crs_lambert)
+# Reproject DEM
+elev_lambert <- elev |> terra::rast() |> terra::project(crs_lambert)
 
-elmat <- rayshader::raster_to_matrix(
-  elev_lambert
-)
-
+# Convert to matrix for rayshader
+elmat <- rayshader::raster_to_matrix(elev_lambert)
 h <- nrow(elev_lambert)
 w <- ncol(elev_lambert)
 
+# Render the 3D scene
 elmat |>
-  rayshader::height_shade(
-    texture = colorRampPalette(
-      cols[9]
-    )(256)
-  ) |>
-  rayshader::add_overlay(
-    img,
-    alphalayer = 1
-  ) |>
+  rayshader::height_shade(texture = colorRampPalette(cols[9])(256)) |>
+  rayshader::add_overlay(img, alphalayer = 1) |>
   rayshader::plot_3d(
     elmat,
     zscale = 12,
-    solid = F,
-    shadow = T,
+    solid = FALSE,
+    shadow = TRUE,
     shadow_darkness = 1,
     background = "white",
-    windowsize = c(
-      w / 5, h / 5
-    ),
+    windowsize = c(w / 5, h / 5),
     zoom = .5,
     phi = 85,
     theta = 0
   )
 
-rayshader::render_camera(
-  zoom = .58
-)
+# Adjust camera slightly
+rayshader::render_camera(zoom = .58)
 
-# 10. RENDER OBJECT
-#-----------------
+# ---------------------------
+# 10. Render High-Quality Image
+# ---------------------------
 
+# Download HDRI background for lighting
 u <- "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/4k/air_museum_playground_4k.hdr"
 hdri_file <- basename(u)
+download.file(url = u, destfile = hdri_file, mode = "wb")
 
-download.file(
-  url = u,
-  destfile = hdri_file,
-  mode = "wb"
-)
-
+# Save a high-quality 3D render
 filename <- "3d_land_cover_belgium-dark.png"
-
 rayshader::render_highquality(
   filename = filename,
-  preview = T,
-  light = F,
+  preview = TRUE,
+  light = FALSE,
   environment_light = hdri_file,
   intensity_env = 1,
   rotate_env = 90,
-  interactive = F,
-  parallel = T,
+  interactive = FALSE,
+  parallel = TRUE,
   width = w * 1.5,
   height = h * 1.5
 )
 
-# 11. PUT EVERYTHING TOGETHER
+# ---------------------------
+# 11. Add a Legend to the Final Image
+# ---------------------------
 
+# Color references
 c(
   "#419bdf", "#397d49", "#7a87c6", 
   "#e49635", "#c4281b", "#a59b8f", 
   "#a8ebff", "#616161", "#e3e2c3"
 )
 
+# Build a legend image
 legend_name <- "land_cover_legend.png"
 png(legend_name)
 par(family = "mono")
-
-plot(
-  NULL,
-  xaxt = "n",
-  yaxt = "n",
-  bty = "n",
-  ylab = "",
-  xlab = "",
-  xlim = 0:1,
-  ylim = 0:1,
-  xaxs = "i",
-  yaxs = "i"
-)
-legend(
-  "center",
-  legend = c(
-    "Water",
-    "Trees",
-    "Crops",
-    "Built Area",
-    "Rangeland"
-  ),
-  pch = 15,
-  cex = 2,
-  pt.cex = 1,
-  bty = "n",
-  col = c(cols[c(1:2, 4:5, 9)]),
-  fill = c(cols[c(1:2, 4:5, 9)]),
-  border = "grey20"
-)
+plot(NULL, xaxt = "n", yaxt = "n", bty = "n", ylab = "", xlab = "",
+     xlim = 0:1, ylim = 0:1, xaxs = "i", yaxs = "i")
+legend("center",
+       legend = c("Water", "Trees", "Crops", "Built Area", "Rangeland"),
+       pch = 15, cex = 2, pt.cex = 1, bty = "n",
+       col = c(cols[c(1:2, 4:5, 9)]),
+       fill = c(cols[c(1:2, 4:5, 9)]),
+       border = "grey20")
 dev.off()
 
-# filename <- "land-cover-bih-3d-b.png"
+# Load the rendered image and the legend
+lc_img <- magick::image_read(filename)
+my_legend <- magick::image_read(legend_name)
 
-lc_img <- magick::image_read(
-  filename
-)
+# Resize the legend to fit
+my_legend_scaled <- magick::image_scale(magick::image_background(my_legend, "none"), 2500)
 
-my_legend <- magick::image_read(
-  legend_name
-)
-
-my_legend_scaled <- magick::image_scale(
-  magick::image_background(
-    my_legend, "none"
-  ), 2500
-)
-
+# Combine legend and main image
 p <- magick::image_composite(
-  magick::image_scale(
-    lc_img, "x7000" 
-  ),
+  magick::image_scale(lc_img, "x7000"),
   my_legend_scaled,
   gravity = "southwest",
   offset = "+100+0"
 )
 
-magick::image_write(
-  p, "3d_belgium_land_cover_final.png"
-)
+# Save the final image
+magick::image_write(p, "3d_belgium_land_cover_final.png")
